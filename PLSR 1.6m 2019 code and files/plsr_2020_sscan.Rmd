@@ -1,0 +1,277 @@
+---
+title: "PLSR_SSCAN_2020"
+author: "Rachel Corrigan"
+date: "9/14/2020"
+output: html_document
+---
+
+This code is for running a PLSR for the 2020 SCAN data. This can be adapted for any 
+depth or combination of depths, or years. All that you need is the grab sample water
+quality data, overlapping mux or scan data with the WQ data, and the mux/scan data for
+the full timeseries that you want chem predictions for. You will just alter the files
+that you import. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Set up your packages, data locations, working directory
+
+```{r}
+library(pls) 
+library(lubridate)
+library(dplyr)
+library(stringr)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+pathD<-"/Users/rachelcorrigan/Dropbox/fcr/MagicData/" #EDIT: Specify folder where data is located
+setwd("/Users/rachelcorrigan/Dropbox/fcr/MagicData/")
+
+```
+
+
+Read in FCR WQ data
+
+The format of the water chem data from the lab is in correct format. 
+This steps are just cleaning and removing some extra columns (not necessary, just me), and 
+assigning column names. You could merge the metals data with this data, and just add the 
+column names. Thats what I did for 2018 analysis.
+The WQ data used in this analysis are from 2019. Update this to 2020 when that becomes available.
+This has been subset to 1.6m.
+
+
+```{r}
+WQ<-"onedepth2019WQoverlaps.csv" #Specify file where data is located  
+dataWQ<-read.table(file=paste(pathD,WQ,sep=""),sep=",",header = TRUE)  #Import data as .csv file
+dataWQ=dataWQ[,-c(16:24)]
+dataWQ=dataWQ[,-c(1:4)]
+WQparam <- c("TN_ugL","TP_ugL","NH4_ugL","NO3NO2_ugL","SRP_ugL","DOC_mgL","DIC_mgL", "DC_mgL", "DN_mgL")   
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+Reading of  FingerPrint (FP) file corresponding to lab concentrations for 
+calibration hence dataCalFP
+
+This step reads in the file of overlapping MUX/SCAN data and field data. Again, 
+this is from 2019, and is the MUX overlap with 2019 wq data at 1.6m.
+
+```{r}
+FPcaldata_name<-"onedepth2019FPoverlaps.csv"
+dataCalFP<-read.delim(file=paste(pathD,FPcaldata_name,sep=""),sep=",")  #Import data as .csv file
+colnames(dataCalFP)<-c("ID","Date/Time","status",seq(200,730,2.5)) #Add column names
+
+#subset if doing depth specific model (i.e., 0.1 and 1.6, 3-6, 8-9, etc.)
+#dataCalFP <- dataCalFP %>%
+#  filter(ID == 1 | ID == 2 | ID == 3) #%>%
+#  filter(ID == 2) %>%
+#  filter(ID == 3)
+
+
+timesCalFP<-dataCalFP[,1:2] 
+dataCalFP<-dataCalFP[,-c(1:3)]
+dataCalFP<-dataCalFP[,-214:-216] #Remove NO3-N values and NAs at high wavelengths
+dataCalFP<-data.matrix(dataCalFP) #Convert to data matrix
+
+```
+
+This replaces the ID and Date from the original dataWQ with the exact values
+from the SCAN so that manual values can be plotted later on in the TS plots
+
+
+```{r}
+dataWQ$ID<-timesCalFP[,1]
+dataWQ$DateTime<-timesCalFP[,2]
+```
+
+
+Reading of  FingerPrint (FP) file corresponding to the entire time series (TS) 
+This is the 2020 SCAN data. 
+
+```{r}
+TimeSeriesFP_name<-"SSCAN_DATA_08282020.csv"
+TS_FP<-read.table(file=paste(pathD,TimeSeriesFP_name,sep=""),sep=",", skip=1)  #Import Time Series data as .csv file
+TS_FP<-TS_FP[,-c(217:225)]
+TS_FP<-TS_FP[,-1]
+
+colnames(TS_FP)<-c("Date","status",seq(200,730,2.5)) #Add column names
+TS_FP$Date = as.POSIXct(TS_FP$Date, format = "%Y-%m-%d %H:%M:%S")
+
+#if doing depth specific
+#TS_FP <- TS_FP %>%
+#  filter(port != 10 | port !=11 | port !=12) #%>%
+#  filter(port !=11) %>%
+#  filter(port !=12)
+
+Dat<-strptime(TS_FP$Date, format = "%Y-%m-%d %H:%M:%S") #Create record of date and time
+
+```
+
+
+Create matrix to store calculated concentrationss:TS_conc
+
+```{r}
+TS_conc<-as.data.frame(matrix(0,dim(TS_FP)[1],11))  #Create data frame for date/time and predicted NO3-N values
+TS_conc[,1]<-1.6
+TS_conc[,2]<-as.character(Dat, "%Y-%m-%d %H:%M:%S")
+colnames(TS_conc)<-c("Depth", "DateTime",WQparam) #Add column names
+TS_FP<-TS_FP[,(-1:-2)]
+TS_FP<-data.matrix(TS_FP) #Convert spectrometer output to matrix
+
+```
+
+Specify number of components for wq param
+
+```{r}
+ncomp=9 
+```
+
+function which does the calibration and then calculates conc from the TS for
+a given chemical parameter (param).  It does the calibration for a given 
+number of components (ncomp)
+
+
+```{r}
+PLSR_SCAN<-function(param,dataCalFP,dataWQ,TS_FP,ncomp,yesplot=FALSE){
+  
+  WQ<-data.matrix(subset(dataWQ,select=param)) #Make matrix of the param values
+  temp<-cbind(dataCalFP,WQ) #combines FP and WQ columns to remove the rows containing NAs 
+  temp<-temp[complete.cases(temp),] #removes the rows containing NAs
+  WQ<-data.matrix(subset(temp,select=param)) # recreate a data matrix from the WQ vector minus the NAs
+  dataFP<-temp[,-dim(temp)[2]]  # redefines the FP matrix rid off the NA values of missing WQ
+  
+  
+  fit<-plsr(WQ~data.matrix(dataFP),ncomp=ncomp,validation="CV")  #PLSR model to predict param with cross validation
+  summary(fit)  #See summary of PLSR model to choose number of components
+  Pfit<-predict(fit,dataFP,ncomp=ncomp,type=c("response")) #Predict concentrations based on PLSR model
+  #x11()
+  WQP<-as.data.frame(matrix(0,1,dim(dataFP)[1])) #Create data frame for predicted param values
+  WQP<-as.data.frame(Pfit[1:length(Pfit)])  #Insert predicted param values into data frame
+  
+  Pfit_TS<-predict(fit,TS_FP,ncomp=ncomp,type=c("response"))
+  WQP_TS<-as.data.frame(matrix(0,1,dim(TS_FP)[1])) #Create data frame for predicted Time series values
+  WQP_TS<-as.data.frame(Pfit_TS[1:length(Pfit_TS)])  #Insert predicted param values into data frame
+  
+  if (yesplot==TRUE){
+    plot(WQ,as.matrix(WQP),
+         xlab=paste("measured",param,"?g/L",sep=" "),
+         ylab=c("PLSR_predicted")) #Compare predicted and lab values of param
+    
+    fit2<-lm(WQ~as.matrix(WQP)) #Linear regression of predicted and lab NO3-N values
+    abline(fit2)
+    summary(fit2)
+    tp_resid <- resid(fit2)
+  }
+  
+  assign("WQP_TS",WQP_TS,env=.GlobalEnv)
+}
+
+```
+Example for running the function for one parameter only
+
+```{r}
+param<-"NO3NO2_ugL"
+ncomp=10
+PLSR_SCAN(param,dataCalFP,dataWQ,TS_FP,ncomp, yesplot=TRUE)
+```
+
+Using the PLSR model to identify the correct number of components for each nutrient based on the RMSE
+rsing code addapted from CCC original PLSR script
+
+```{r}
+ncomps = c(1:10)
+param="DOC_mgL" #the nutrient you want to find the number of comps for 
+WQ<-data.matrix(subset(dataWQ,select=param)) #matrix of the param values
+temp<-cbind(dataCalFP,WQ) #combines FP and WQ columns to remove the rows containing NAs 
+temp<-temp[complete.cases(temp),] #removes the rows containing NAs
+WQ<-data.matrix(subset(temp,select=param)) # recreate a data matrix from the WQ vector minus the NAs
+dataFP<-temp[,-dim(temp)[2]]  # redefines the FP matrix rid off the NA values of missing WQ
+RMSE <- numeric(length(ncomps))
+
+############
+# Loop 1:10 components through the PLSR model and plot the RMSE of thepredictions
+############
+
+for (i in 1:length(ncomps)) {  
+  fit<-plsr(WQ~data.matrix(dataFP),ncomps[i],validation="CV")  #PLSR model to predict param with cross validation
+  summary(fit)  #See summary of PLSR model to choose number of components
+  Pfit<-predict(fit,dataFP,ncomps[i],type=c("response")) #Predict NO3-N concentrations based on PLSR model
+  #x11()
+  WQP<-as.data.frame(matrix(0,1,dim(dataFP)[1])) #Create data frame for predicted param values
+  WQP<-as.data.frame(Pfit[1:length(Pfit)])  #Insert predicted param values into data frame
+  
+  Pfit_TS<-predict(fit,TS_FP, ncomps[i],type=c("response"))
+  WQP_TS<-as.data.frame(matrix(0,1,dim(TS_FP)[1])) #Create data frame for predicted Time series values
+  WQP_TS<-as.data.frame(Pfit_TS[1:length(Pfit_TS)])  #Insert predicted param values into data frame
+  RMSE[i]<-sqrt(mean((WQ-WQP$`Pfit[1:length(Pfit)]` )^2)) #write out rmse values for each # of components
+  
+}
+plot(RMSE) #plot RMSE curve
+
+#############
+#Choose the number that is at the bottom of the curve, plus 1. 
+############
+
+```
+ 
+If there are obvious outliers, run whats in the PLSR loop, then click on the points.
+This will give you a location of which datapoints are outliers, and you can then 
+remove them from the WQ and dataCalFP dataframes. 
+
+```{r}
+out <- sapply(list(WQ,as.matrix(WQP)),"[",identify(WQ,as.matrix(WQP)))
+out
+```
+
+Make sure that your datetimes are formatted correctly before plotting
+
+```{r}
+TS_conc$DateTime <- as.POSIXct(TS_conc$DateTime, format="%Y-%m-%d %H:%M:%S")
+dataWQ$DateTime <- as.POSIXct(dataWQ$DateTime, format="%m/%d/%y %H:%M")
+colnames(dataWQ)[2] <- "Depth"   #rename this column for plotting
+```
+
+assign the predictions to the correct column in the TS_conc matrix. This portion of the script will
+change for each nutrient. change number is "sd(as.numeric(fit$residuals[,,X]))" to match number of components,
+and change column names (i.e. "TS_conc$uncerNO2_max") to match nutrient.
+
+```{r}
+
+TS_conc$uncerNO2_max <- NA
+TS_conc$uncerNO2_min <- NA
+TS_conc$uncerNO2_max <- WQP_TS + 1.96*sd(as.numeric(fit$residuals[,,10])) #max uncert
+TS_conc$uncerNO2_min <- WQP_TS - 1.96*sd(as.numeric(fit$residuals[,,10])) #min uncert
+TS_conc$uncerNO2_max <- unlist(TS_conc$uncerNO2_max)
+TS_conc$uncerNO2_min <- unlist(TS_conc$uncerNO2_min)
+
+```
+
+Assign WQP_TS to correct nutrient column in TS_conc dataframe.
+
+```{r}
+#TS_conc[,(7)]<-10^(WQP_TS) #for SRP
+#TS_conc[,(8)]<-10^(WQP_TS) #for DOC
+#TS_conc[,(5)]<-WQP_TS #for NH4
+TS_conc[,(6)]<-WQP_TS #for N03N02
+#TS_conc[,(9)]<-WQP_TS #for DIC
+#TS_conc[,(10)]<-10^WQP_TS #for DC
+#TS_conc[,(11)]<-10^WQP_TS #for DN
+```
+
+Now plot the results
+
+```{r}
+NO3_plot <- ggplot() +
+  geom_point(data=TS_conc, aes(x=DateTime,y=NO3NO2_ugL), size=0.5) +
+  #geom_ribbon(data=TS_conc, aes(ymin=uncerNO3_min, ymax=uncerNO3_max, x=DateTime, fill = "band"), alpha = 0.2)+
+  #geom_point(data=dataWQ, aes(x=DateTime, y=NO3NO2_ugL), colour="blue") +
+  #ylim(-5, 50)+
+  labs(x="Date", y = expression(paste("NO3NO2 (", mu, "g/L)")), title = "Predicted NO3NO2 at 1.6m, 2020") +
+  scale_x_datetime(labels = date_format("%Y-%m-%d"))+
+  theme(legend.position="none")
+NO3_plot
+```
+
+This script can be adapted for any depths, combination of depths, and nutrients. Right now, you have to rerun for each individual nutrient, but this could be made into a loop.
